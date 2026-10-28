@@ -15,7 +15,6 @@
 #include <signal.h>
 #include <time.h>
 #include <stdarg.h>
-#include <ctype.h>
 #include <dirent.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -38,6 +37,7 @@
 #define HANDSHAKE_TIMEOUT_SEC  10
 #define RBUF_INIT           512
 #define MAX_MAIL_SIZE (50 * 1024 * 1024)
+#define MAX_SENDQ_BYTES  (64 * 1024 * 1024)
 
 #define LOG(fmt, ...) do { \
     struct timespec _ts; \
@@ -84,6 +84,7 @@ struct session {
 
     struct sendq_node *send_head;
     struct sendq_node *send_tail;
+    size_t sendq_bytes;
 
     struct session * next;
 };
@@ -96,7 +97,7 @@ struct server {
     struct session * cons;
 };
 
-static volatile int g_run;
+static volatile sig_atomic_t g_run;
 
 static void sendq_free(struct session *conn) {
     struct sendq_node *n = conn->send_head;
@@ -151,6 +152,7 @@ static int sendq_attach(struct session *conn, char *data, size_t len) {
         conn->send_head = node;
     }
     conn->send_tail = node;
+    conn->sendq_bytes += len;
     return 0;
 }
 
@@ -340,7 +342,6 @@ static int pop3_cmd_pass(struct session * conn, const char * arg) {
     }
     LOG("AUTH FAIL %s", conn->cip);
     conn_send(conn, "-ERR failed bye");
-    memset(conn->user_tmp, 0, sizeof(conn->user_tmp));
     return -1;
 }
 
@@ -500,6 +501,10 @@ static char *mail_encode(const char *raw, size_t raw_size, int crlf, size_t *out
 }
 
 static int mail_send(struct session *conn, int msgno, int max_lines) {
+    if (conn->sendq_bytes > MAX_SENDQ_BYTES) {
+        conn_send(conn, "-ERR busy");
+        return 0;
+    }
     size_t raw_size = 0;
     char *raw = mail_read(conn->msgs[msgno - 1].path, &raw_size);
     if (!raw) {
@@ -714,7 +719,7 @@ static void epoll_mod(struct server * srv, struct session * conn, uint32_t event
     epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
 }
 
-static int process_read(struct server *srv, struct session *conn) {
+static int process_read(struct session *conn) {
     char tmp[4096];
     do {
         ssize_t n = gnutls_record_recv(conn->tls, tmp, sizeof(tmp));
@@ -751,6 +756,7 @@ static int sendq_flush(struct session *conn) {
         ssize_t n = gnutls_record_send(conn->tls, ptr, rem);
         if (n > 0) {
             node->sent += (size_t)n;
+            conn->sendq_bytes -= (size_t)n;
             if (node->sent == node->size) {
                 conn->send_head = node->next;
                 if (!conn->send_head) conn->send_tail = NULL;
@@ -806,7 +812,7 @@ static void handle_conn_io(struct server *srv, struct session *conn, uint32_t ev
         }
     }
     if ((events & EPOLLIN) && conn->phase == CONN_RUNNING) {
-        int r = process_read(srv, conn);
+        int r = process_read(conn);
         if (r != 0) {
             conn->phase = CONN_CLOSING;
             int fr = sendq_flush(conn);
@@ -949,7 +955,7 @@ static void accept_new_connections(struct server *srv) {
         gnutls_transport_set_int(tls, cfd);
         gnutls_certificate_server_set_request(tls, GNUTLS_CERT_IGNORE);
 
-        struct session *conn = conn_new(srv, cfd, tls);
+        struct session * conn = conn_new(srv, cfd, tls);
         if (!conn) {
             gnutls_deinit(tls);
             close(cfd);
@@ -975,7 +981,7 @@ static void run_event_loop(struct server *srv) {
         }
 
         for (int i = 0; i < nfds; i++) {
-            struct session *conn = events[i].data.ptr;
+            struct session * conn = events[i].data.ptr;
             if (!conn) {
                 accept_new_connections(srv);
                 continue;
@@ -1012,15 +1018,10 @@ static void signal_handler(int sig) {
 
 int main(int argc, char *argv[]) {
     int port = (argc > 1) ? atoi(argv[1]) : PORT;
-    char * cert_path = (argc > 2) ? argv[2] : CERT;
-    char * key_path = (argc > 3) ? argv[3] : KEY;
 
     struct server srv = {
-        .tls_creds = NULL,
-        .tls_prio = NULL,
         .epoll_fd = -1,
         .server_fd = -1,
-        .cons = NULL,
     };
     g_run = 1;
 
@@ -1030,7 +1031,7 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    if (create_tls_context(&srv, cert_path, key_path) < 0) {
+    if (create_tls_context(&srv, CERT, KEY) < 0) {
         gnutls_global_deinit();
         return EXIT_FAILURE;
     }
@@ -1041,7 +1042,6 @@ int main(int argc, char *argv[]) {
     }
     srv.epoll_fd = create_epoll(&srv);
     if (srv.epoll_fd < 0) {
-        close(srv.server_fd);
         cleanup(&srv);
         return EXIT_FAILURE;
     }
