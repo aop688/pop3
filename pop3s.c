@@ -30,7 +30,6 @@
 #define MAILDIR             "/var/mail/inbox"
 #define USER                "POPUSER"
 #define PASS                "PASSWORD"
-#define MAX_EVENTS          64
 #define MAX_LINE            1024
 #define INIT_MSG_CAPACITY   16
 #define SESSION_TIMEOUT_SEC    60
@@ -300,22 +299,7 @@ static int pop3_cmd_capa(struct session *conn, const char *arg) {
     return 0;
 }
 
-static int req_state(struct session * conn, int req) {
-    if (conn->state == req) {
-        return 0;
-    }
-    if (req == STATE_TRANSACTION) {
-        conn_send(conn, "-ERR failed");
-    } else {
-        conn_send(conn, "-ERR authed");
-    }
-    return -1;
-}
-
 static int pop3_cmd_user(struct session * conn, const char * arg) {
-    if (req_state(conn, STATE_AUTH) < 0) {
-        return 0;
-    }
     if (!arg) {
         conn_send(conn, "-ERR");
         return 0;
@@ -327,9 +311,6 @@ static int pop3_cmd_user(struct session * conn, const char * arg) {
 }
 
 static int pop3_cmd_pass(struct session * conn, const char * arg) {
-    if (req_state(conn, STATE_AUTH) < 0) {
-        return 1;
-    }
     if (!conn->user_tmp[0] || !arg || !*arg) {
         LOG("S: bye ");
         return -1;
@@ -346,9 +327,6 @@ static int pop3_cmd_pass(struct session * conn, const char * arg) {
 }
 
 static int pop3_cmd_stat(struct session * conn, const char *arg) {
-    if (req_state(conn, STATE_TRANSACTION) < 0) {
-        return 0;
-    }
     off_t total = 0;
     int count = 0;
     for (int i = 0; i < (int)conn->msg_size; i++) {
@@ -362,9 +340,6 @@ static int pop3_cmd_stat(struct session * conn, const char *arg) {
 }
 
 static int pop3_cmd_list(struct session *conn, const char *arg) {
-    if (req_state(conn, STATE_TRANSACTION) < 0) {
-        return 0;
-    }
     if (arg && *arg) {
         int n = parse_msgno(arg);
         if (!msg_valid(conn, n)) {
@@ -410,9 +385,6 @@ static void msg_uid(const char * fname, char * out) {
 }
 
 static int pop3_cmd_uidl(struct session * conn, const char *arg) {
-    if (req_state(conn, STATE_TRANSACTION) < 0){
-        return 0;
-    }
     char uid[33];
     if (arg && *arg) {
         int n = parse_msgno(arg);
@@ -559,7 +531,6 @@ static int parse_retr_args(const char *arg, int *msgno, int *lines) {
 }
 
 static int pop3_cmd_retr(struct session *conn, const char *arg) {
-    if (req_state(conn, STATE_TRANSACTION) < 0) return 0;
     int n, lines;
     if (parse_retr_args(arg, &n, &lines) < 0 || lines != -1) {
         conn_send(conn, "-ERR invalid");
@@ -573,7 +544,6 @@ static int pop3_cmd_retr(struct session *conn, const char *arg) {
 }
 
 static int pop3_cmd_top(struct session *conn, const char *arg) {
-    if (req_state(conn, STATE_TRANSACTION) < 0) return 0;
     int n, lines;
     if (!arg || parse_retr_args(arg, &n, &lines) < 0 || lines < 0) {
         conn_send(conn, "-ERR invalid");
@@ -592,9 +562,6 @@ static int pop3_cmd_noop(struct session *conn, const char *arg) {
 }
 
 static int pop3_cmd_dele(struct session *conn, const char *arg) {
-    if (req_state(conn, STATE_TRANSACTION) < 0) {
-        return 0;
-    }
     int n = parse_msgno(arg);
     if (!msg_valid(conn, n)) {
         conn_send(conn, "-ERR no message");
@@ -606,9 +573,6 @@ static int pop3_cmd_dele(struct session *conn, const char *arg) {
 }
 
 static int pop3_cmd_rset(struct session * conn, const char * arg) {
-    if (req_state(conn, STATE_TRANSACTION) < 0) {
-        return 0;
-    }
     for (int i = 0; i < (int)conn->msg_size; i++) {
         conn->msgs[i].del = 0;
     }
@@ -632,36 +596,45 @@ static int pop3_cmd_quit(struct session * conn, const char * arg) {
 
 typedef int (*cmd_fn)(struct session * conn, const char * arg);
 
+#define ANY_STATE  (-1)
+
 struct pop3_cmd {
     const char *cmd;
+    int state;
     cmd_fn func;
 };
 
 static const struct pop3_cmd pop3_cmd_table[] = {
-    { "CAPA", pop3_cmd_capa },
-    { "USER", pop3_cmd_user },
-    { "PASS", pop3_cmd_pass },
-    { "STAT", pop3_cmd_stat },
-    { "LIST", pop3_cmd_list },
-    { "TOP",  pop3_cmd_top },
-    { "UIDL", pop3_cmd_uidl },
-    { "RETR", pop3_cmd_retr },
-    { "NOOP", pop3_cmd_noop },
-    { "DELE", pop3_cmd_dele },
-    { "RSET", pop3_cmd_rset },
-    { "QUIT", pop3_cmd_quit },
+    { "CAPA", ANY_STATE,         pop3_cmd_capa },
+    { "NOOP", ANY_STATE,         pop3_cmd_noop },
+    { "QUIT", ANY_STATE,         pop3_cmd_quit },
+    { "USER", STATE_AUTH,        pop3_cmd_user },
+    { "PASS", STATE_AUTH,        pop3_cmd_pass },
+    { "STAT", STATE_TRANSACTION, pop3_cmd_stat },
+    { "LIST", STATE_TRANSACTION, pop3_cmd_list },
+    { "TOP",  STATE_TRANSACTION, pop3_cmd_top  },
+    { "UIDL", STATE_TRANSACTION, pop3_cmd_uidl },
+    { "RETR", STATE_TRANSACTION, pop3_cmd_retr },
+    { "DELE", STATE_TRANSACTION, pop3_cmd_dele },
+    { "RSET", STATE_TRANSACTION, pop3_cmd_rset },
 };
 
-static int dispatch_pop3_cmd(struct session * conn, const char * cmd, const char * arg) {
+static int dispatch_pop3_cmd(struct session *conn, const char *cmd, const char *arg) {
     if (!cmd) {
         conn_send(conn, "-ERR");
         return -1;
     }
-    size_t cmds = sizeof(pop3_cmd_table) / sizeof(*pop3_cmd_table);
-    for (size_t i = 0; i < cmds; i++) {
+    size_t n = sizeof(pop3_cmd_table) / sizeof(*pop3_cmd_table);
+    for (size_t i = 0; i < n; i++) {
         const struct pop3_cmd *p = &pop3_cmd_table[i];
-        if (!strcmp(p->cmd, cmd))
-            return p->func(conn, arg);
+        if (strcmp(p->cmd, cmd) != 0)
+            continue;
+
+        if (p->state != ANY_STATE && p->state != conn->state) {
+            conn_send(conn, "-ERR failed");
+            return 0;
+        }
+        return p->func(conn, arg);
     }
     conn_send(conn, "-ERR");
     return -1;
@@ -968,16 +941,13 @@ static void accept_new_connections(struct server *srv) {
 }
 
 static void run_event_loop(struct server *srv) {
-    struct epoll_event events[MAX_EVENTS];
+    struct epoll_event events[64];
     time_t last_check = time(NULL);
     while (g_run) {
-        int nfds = epoll_wait(srv->epoll_fd, events, MAX_EVENTS, 1000);
+        int nfds = epoll_wait(srv->epoll_fd, events, 64, 1000);
         if (nfds < 0) {
-            if (errno != EINTR) {
-                perror("epoll_wait");
-                break;
-            }
-            nfds = 0;
+            perror("epoll_wait");
+            break;
         }
 
         for (int i = 0; i < nfds; i++) {
@@ -1024,9 +994,7 @@ int main(int argc, char *argv[]) {
         .server_fd = -1,
     };
     g_run = 1;
-
     gnutls_global_init();
-
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
