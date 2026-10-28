@@ -34,7 +34,6 @@
 #define INIT_MSG_CAPACITY   16
 #define SESSION_TIMEOUT_SEC    60
 #define HANDSHAKE_TIMEOUT_SEC  10
-#define RBUF_INIT           512
 #define MAX_MAIL_SIZE (50 * 1024 * 1024)
 #define MAX_SENDQ_BYTES  (64 * 1024 * 1024)
 
@@ -77,8 +76,7 @@ struct session {
     size_t msg_size;
     size_t msg_cap;
 
-    char * rbuf;
-    size_t rbuf_cap;
+    char rbuf[256];
     size_t rlen;
 
     struct sendq_node *send_head;
@@ -132,7 +130,6 @@ static void conn_free(struct server *srv, struct session *conn) {
         free(conn->msgs[i].path);
     }
     free(conn->msgs);
-    free(conn->rbuf);
     sendq_free(conn);
     free(conn);
 }
@@ -640,48 +637,36 @@ static int dispatch_pop3_cmd(struct session *conn, const char *cmd, const char *
     return -1;
 }
 
-static int rbuf_grow(struct session * conn) {
-    if (conn->rbuf_cap >= MAX_LINE)
-        return -1;
-    int new_cap = conn->rbuf_cap * 2;
-    if (new_cap > MAX_LINE)
-        new_cap = MAX_LINE;
-    char *tmp = realloc(conn->rbuf, new_cap);
-    if (!tmp) {
-        return -1;
-    }
-    conn->rbuf = tmp;
-    conn->rbuf_cap = new_cap;
-    return 0;
-}
-
-static void rbuf_shrink(struct session * conn) {
-    if (conn->rbuf_cap <= RBUF_INIT) return;
-    char *tmp = realloc(conn->rbuf, RBUF_INIT);
-    if (tmp) {
-        conn->rbuf = tmp;
-        conn->rbuf_cap = RBUF_INIT;
-    }
-}
-
 static int process_line(struct session *conn) {
+    if (conn->rlen > 0 && conn->rbuf[conn->rlen - 1] == '\r')
+        conn->rlen--;
     conn->rbuf[conn->rlen] = '\0';
     conn->rlen = 0;
     LOG("C: %s", conn->rbuf);
     char *saveptr;
     char *cmd = strtok_r(conn->rbuf, " ", &saveptr);
     char *arg = strtok_r(NULL, "", &saveptr);
-    int ret = dispatch_pop3_cmd(conn, cmd, arg);
-    rbuf_shrink(conn);
-    return ret;
+    return dispatch_pop3_cmd(conn, cmd, arg);
 }
 
-static int rbuf_append(struct session * conn, char ch) {
-    if (conn->rlen + 1 >= conn->rbuf_cap) {
-        if (rbuf_grow(conn) < 0)
-            return -1;
+static int feed_input(struct session *conn, const char *data, size_t len) {
+    while (len > 0) {
+        const char *nl = memchr(data, '\n', len);
+        size_t chunk = nl ? (size_t)(nl - data) : len;
+
+        if (conn->rlen + chunk >= sizeof(conn->rbuf)) {
+            conn_send(conn, "-ERR line too long");
+            return 1;
+        }
+        memcpy(conn->rbuf + conn->rlen, data, chunk);
+        conn->rlen += chunk;
+
+        if (!nl) break;
+
+        data += chunk + 1;
+        len -= chunk + 1;
+        if (process_line(conn)) return 1;
     }
-    conn->rbuf[conn->rlen++] = ch;
     return 0;
 }
 
@@ -703,19 +688,8 @@ static int process_read(struct session *conn) {
             return -1;
         }
         conn->expire_at = time(NULL) + SESSION_TIMEOUT_SEC;
-        for (ssize_t i = 0; i < n; i++) {
-            char ch = tmp[i];
-            if (ch == '\n') {
-                int r = process_line(conn);
-                if (r < 0)
-                    return -1;
-                if (r > 0)
-                    return 1;
-            } else if (ch != '\r') {
-                if (rbuf_append(conn, ch) < 0)
-                    return -1;
-            }
-        }
+        if (feed_input(conn, tmp, (size_t)n))
+            return 1;
     } while (gnutls_record_check_pending(conn->tls) > 0);
     return 0;
 }
@@ -885,12 +859,6 @@ static struct session * conn_new(struct server *srv, int cfd, gnutls_session_t t
     if (!conn) {
         return NULL;
     }
-    conn->rbuf = malloc(RBUF_INIT);
-    if (!conn->rbuf) {
-        free(conn);
-        return NULL;
-    }
-    conn->rbuf_cap = RBUF_INIT;
     conn->fd = cfd;
     conn->tls = tls;
     conn->phase = CONN_HANDSHAKE;
@@ -940,27 +908,28 @@ static void accept_new_connections(struct server *srv) {
     }
 }
 
+static void dispatch_event(struct server *srv, struct epoll_event *ev) {
+    struct session *conn = ev->data.ptr;
+    if (!conn)
+        accept_new_connections(srv);
+    else if (conn->phase == CONN_HANDSHAKE)
+        handle_handshake(srv, conn);
+    else
+        handle_conn_io(srv, conn, ev->events);
+}
+
 static void run_event_loop(struct server *srv) {
     struct epoll_event events[64];
     time_t last_check = time(NULL);
     while (g_run) {
         int nfds = epoll_wait(srv->epoll_fd, events, 64, 1000);
         if (nfds < 0) {
+            if (errno == EINTR) continue;
             perror("epoll_wait");
             break;
         }
-
         for (int i = 0; i < nfds; i++) {
-            struct session * conn = events[i].data.ptr;
-            if (!conn) {
-                accept_new_connections(srv);
-                continue;
-            }
-            if (conn->phase == CONN_HANDSHAKE) {
-                handle_handshake(srv, conn);
-            } else {
-                handle_conn_io(srv, conn, events[i].events);
-            }
+            dispatch_event(srv, &events[i]);
         }
         time_t now = time(NULL);
         if (now - last_check >= 1) {
@@ -982,17 +951,13 @@ static void cleanup(struct server *srv) {
 }
 
 static void signal_handler(int sig) {
-    (void)sig;
     g_run = 0;
 }
 
 int main(int argc, char *argv[]) {
     int port = (argc > 1) ? atoi(argv[1]) : PORT;
 
-    struct server srv = {
-        .epoll_fd = -1,
-        .server_fd = -1,
-    };
+    struct server srv = { .epoll_fd = -1, .server_fd = -1, };
     g_run = 1;
     gnutls_global_init();
     signal(SIGPIPE, SIG_IGN);
