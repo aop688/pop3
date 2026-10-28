@@ -53,8 +53,6 @@ enum { STATE_AUTH, STATE_TRANSACTION };
 
 enum { CONN_HANDSHAKE, CONN_RUNNING, CONN_CLOSING };
 
-enum conn_role { ROLE_SERVER, ROLE_CLIENT };
-
 struct mail {
     char *path;
     off_t size;
@@ -69,7 +67,6 @@ struct sendq_node {
 };
 
 struct session {
-    enum conn_role role;
     int fd;
     gnutls_session_t tls;
     int phase;
@@ -92,7 +89,6 @@ struct session {
 };
 
 struct server {
-    enum conn_role role;
     gnutls_certificate_credentials_t tls_creds;
     gnutls_priority_t tls_prio;
     int epoll_fd;
@@ -900,8 +896,7 @@ static int create_epoll(struct server *srv) {
         perror("epoll_create1");
         return -1;
     }
-    srv->role = ROLE_SERVER;
-    struct epoll_event ev = { .events = EPOLLIN, .data.ptr = srv };
+    struct epoll_event ev = { .events = EPOLLIN, .data.ptr = NULL };
     epoll_ctl(epfd, EPOLL_CTL_ADD, srv->server_fd, &ev);
     return epfd;
 }
@@ -917,7 +912,6 @@ static struct session * conn_new(struct server *srv, int cfd, gnutls_session_t t
         return NULL;
     }
     conn->rbuf_cap = RBUF_INIT;
-    conn->role = ROLE_CLIENT;
     conn->fd = cfd;
     conn->tls = tls;
     conn->phase = CONN_HANDSHAKE;
@@ -979,20 +973,17 @@ static void run_event_loop(struct server *srv) {
             }
             nfds = 0;
         }
+
         for (int i = 0; i < nfds; i++) {
-            enum conn_role *role = events[i].data.ptr;
-            switch (*role) {
-            case ROLE_SERVER:
+            struct session *conn = events[i].data.ptr;
+            if (!conn) {
                 accept_new_connections(srv);
-                break;
-            case ROLE_CLIENT: {
-                struct session *conn = (struct session *)role;
-                if (conn->phase == CONN_HANDSHAKE)
-                    handle_handshake(srv, conn);
-                else
-                    handle_conn_io(srv, conn, events[i].events);
-                break;
+                continue;
             }
+            if (conn->phase == CONN_HANDSHAKE) {
+                handle_handshake(srv, conn);
+            } else {
+                handle_conn_io(srv, conn, events[i].events);
             }
         }
         time_t now = time(NULL);
@@ -1025,7 +1016,6 @@ int main(int argc, char *argv[]) {
     char * key_path = (argc > 3) ? argv[3] : KEY;
 
     struct server srv = {
-        .role = ROLE_SERVER,
         .tls_creds = NULL,
         .tls_prio = NULL,
         .epoll_fd = -1,
