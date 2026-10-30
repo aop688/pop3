@@ -9,7 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -24,18 +27,25 @@
 #include <gnutls/gnutls.h>
 #include <gnutls/crypto.h>
 
-#define PORT                995
-#define CERT                "server.crt"
-#define KEY                 "server.key"
-#define MAILDIR             "/var/mail/inbox"
-#define USER                "POPUSER"
-#define PASS                "PASSWORD"
-#define MAX_LINE            1024
-#define INIT_MSG_CAPACITY   16
+#define PORT                   995
+#define CERT                   "server.crt"
+#define KEY                    "server.key"
+#define MAILDIR                "/var/mail/inbox"
+#define USER                   "POPUSER"
+#define PASS                   "PASSWORD"
+#define MAX_LINE               1024
+#define INIT_MSG_CAPACITY      16
 #define SESSION_TIMEOUT_SEC    60
 #define HANDSHAKE_TIMEOUT_SEC  10
-#define MAX_MAIL_SIZE (50 * 1024 * 1024)
-#define MAX_SENDQ_BYTES  (64 * 1024 * 1024)
+#define MAX_MAIL_SIZE          (50 * 1024 * 1024)
+#define MAX_SENDQ_BYTES        (1024 * 1024)
+#define STREAM_CHUNK           8192
+#define SEND_BUDGET            (256 * 1024)
+#define MAX_PENDING_RETR       4
+
+#define MAX_ARGS               1
+#define MAX_AUTH_FAILS         3
+#define MAX_BAD_CMDS           2
 
 #define LOG(fmt, ...) do { \
     struct timespec _ts; \
@@ -51,6 +61,12 @@ enum { STATE_AUTH, STATE_TRANSACTION };
 
 enum { CONN_HANDSHAKE, CONN_RUNNING, CONN_CLOSING };
 
+enum cmd_result {
+    CMD_OK    =  0,   /* 继续会话 */
+    CMD_QUIT  =  1,   /* 正常结束：flush 后关闭 */
+    CMD_FATAL = -1,   /* 异常：flush 后关闭 */
+};
+
 struct mail {
     char *path;
     off_t size;
@@ -61,6 +77,10 @@ struct sendq_node {
     char *data;
     size_t size;
     size_t sent;
+    int stream;
+    int fd;
+    int line_start;
+    int prev_cr;
     struct sendq_node *next;
 };
 
@@ -72,7 +92,10 @@ struct session {
     time_t expire_at;
     char cip[INET_ADDRSTRLEN];
     char user_tmp[64];
-    struct mail * msgs;
+    int auth_fails;
+    int bad_cmds;
+
+    struct mail *msgs;
     size_t msg_size;
     size_t msg_cap;
 
@@ -82,6 +105,7 @@ struct session {
     struct sendq_node *send_head;
     struct sendq_node *send_tail;
     size_t sendq_bytes;
+    size_t pending_streams;
 
     struct session * next;
 };
@@ -96,15 +120,22 @@ struct server {
 
 static volatile sig_atomic_t g_run;
 
+static void node_free(struct sendq_node *n) {
+    if (n->fd >= 0) close(n->fd);
+    free(n->data);
+    free(n);
+}
+
 static void sendq_free(struct session *conn) {
     struct sendq_node *n = conn->send_head;
     while (n) {
         struct sendq_node *next = n->next;
-        free(n->data);
-        free(n);
+        node_free(n);
         n = next;
     }
     conn->send_head = conn->send_tail = NULL;
+    conn->sendq_bytes = 0;
+    conn->pending_streams = 0;
 }
 
 static void conn_free(struct server *srv, struct session *conn) {
@@ -126,7 +157,7 @@ static void conn_free(struct server *srv, struct session *conn) {
     }
     close(conn->fd);
 
-    for (int i = 0; i < (int)conn->msg_size; i++) {
+    for (size_t i = 0; i < conn->msg_size; i++) {
         free(conn->msgs[i].path);
     }
     free(conn->msgs);
@@ -134,21 +165,85 @@ static void conn_free(struct server *srv, struct session *conn) {
     free(conn);
 }
 
-static int sendq_attach(struct session *conn, char *data, size_t len) {
-    struct sendq_node *node = malloc(sizeof(struct sendq_node));
-    if (!node) return -1;
-    node->data  = data;
-    node->size  = len;
-    node->sent  = 0;
-    node->next  = NULL;
-
+static void sendq_append(struct session *conn, struct sendq_node *node) {
+    node->next = NULL;
     if (conn->send_tail) {
         conn->send_tail->next = node;
     } else {
         conn->send_head = node;
     }
     conn->send_tail = node;
+}
+
+static int sendq_attach(struct session *conn, char *data, size_t len) {
+    struct sendq_node *node = calloc(1, sizeof(*node));
+    if (!node) return -1;
+    node->data = data;
+    node->size = len;
+    node->fd = -1;
+    sendq_append(conn, node);
     conn->sendq_bytes += len;
+    return 0;
+}
+
+static int sendq_busy(const struct session *conn) {
+    return conn->sendq_bytes > MAX_SENDQ_BYTES || conn->pending_streams >= MAX_PENDING_RETR;
+}
+
+static struct sendq_node *stream_node_new(int fd) {
+    struct sendq_node *node = calloc(1, sizeof(*node));
+    if (!node) return NULL;
+    node->data = malloc(2 * STREAM_CHUNK + 8);
+    if (!node->data) {
+        free(node);
+        return NULL;
+    }
+    node->stream = 1;
+    node->fd = -1;
+    node->line_start = 1;
+    node->prev_cr = 0;
+    node->fd = fd;
+    return node;
+}
+
+static int stream_refill(struct sendq_node *n) {
+    char raw[STREAM_CHUNK];
+    ssize_t r;
+    do {
+        r = read(n->fd, raw, sizeof(raw));
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) {
+        LOG("read mail: %s", strerror(errno));
+        return -1;
+    }
+
+    char *wp = n->data;
+    if (r == 0) {
+        if (!n->line_start) {
+            if (!n->prev_cr) *wp++ = '\r';
+            *wp++ = '\n';
+        }
+        *wp++ = '.'; *wp++ = '\r'; *wp++ = '\n';
+        close(n->fd);
+        n->fd = -1;
+    } else {
+        for (ssize_t i = 0; i < r; i++) {
+            char c = raw[i];
+            if (c == '\n') {
+                if (!n->prev_cr) *wp++ = '\r';
+                *wp++ = '\n';
+                n->line_start = 1;
+                n->prev_cr = 0;
+                continue;
+            }
+            if (n->line_start && c == '.') *wp++ = '.';
+            *wp++ = c;
+            n->line_start = 0;
+            n->prev_cr = (c == '\r');
+        }
+    }
+    n->size = (size_t)(wp - n->data);
+    n->sent = 0;
     return 0;
 }
 
@@ -163,19 +258,19 @@ static int conn_send(struct session *conn, const char *fmt, ...) {
         free(buf);
         return -1;
     }
-    if (len >= MAX_LINE - 2) len = MAX_LINE - 2;
+    if (len >= MAX_LINE - 2) len = MAX_LINE - 3;
     buf[len] = '\r';
     buf[len + 1] = '\n';
     LOG("S: %.*s", len, buf);
-    if (sendq_attach(conn, buf, len + 2) < 0) {
+    if (sendq_attach(conn, buf, (size_t)len + 2) < 0) {
         free(buf);
         return -1;
     }
     return 0;
 }
 
-static void new_to_cur() {
-    DIR *dir = opendir(MAILDIR"/new");
+static void new_to_cur(void) {
+    DIR *dir = opendir(MAILDIR "/new");
     if (!dir) return;
 
     struct dirent *entry;
@@ -199,7 +294,7 @@ static void new_to_cur() {
     closedir(dir);
 }
 
-static size_t load_mailbox(struct session * conn, char * dirpath) {
+static size_t load_mailbox(struct session *conn, const char *dirpath) {
     for (size_t i = 0; i < conn->msg_size; i++) {
         free(conn->msgs[i].path);
         conn->msgs[i].path = NULL;
@@ -219,7 +314,7 @@ static size_t load_mailbox(struct session * conn, char * dirpath) {
     if (!dir) {
         return 0;
     }
-    struct dirent * entry;
+    struct dirent *entry;
     while ((entry = readdir(dir))) {
         if (entry->d_name[0] == '.') continue;
 
@@ -231,25 +326,23 @@ static size_t load_mailbox(struct session * conn, char * dirpath) {
         if (stat(filepath, &st) != 0 || !S_ISREG(st.st_mode)) continue;
 
         if (st.st_size <= 0 || st.st_size > MAX_MAIL_SIZE) {
-            LOG("MAILBOX skip oversized file: %s (%lld bytes)",
-            filepath, (long long)st.st_size);
+            LOG("MAILBOX skip bad-size file: %s (%lld bytes)",
+                filepath, (long long)st.st_size);
             continue;
         }
 
         if (conn->msg_size == conn->msg_cap) {
             size_t new_cap = conn->msg_cap * 2;
-            struct mail * tmp = realloc(conn->msgs, new_cap * sizeof(struct mail));
+            struct mail *tmp = realloc(conn->msgs, new_cap * sizeof(struct mail));
             if (!tmp) continue;
             conn->msgs = tmp;
             conn->msg_cap = new_cap;
         }
 
-        struct mail * msg = &conn->msgs[conn->msg_size];
+        struct mail *msg = &conn->msgs[conn->msg_size];
         msg->path = strdup(filepath);
-        if (!msg->path) {
-            continue;
-        }
-        msg->size = (size_t)st.st_size;
+        if (!msg->path) continue;
+        msg->size = st.st_size;
         msg->del = 0;
         conn->msg_size++;
     }
@@ -257,123 +350,46 @@ static size_t load_mailbox(struct session * conn, char * dirpath) {
     return conn->msg_size;
 }
 
-static int auth_userpass(const char * user, const char * password) {
+static int auth_userpass(const char *user, const char *password) {
     size_t ulen = strlen(USER);
     size_t plen = strlen(PASS);
-    int user_ok = (strlen(user) == ulen) & (gnutls_memcmp(user, USER, ulen) == 0);
-    int pass_ok = (strlen(password) == plen) & (gnutls_memcmp(password, PASS, plen) == 0);
+    int user_ok = (strlen(user) == ulen) ? (gnutls_memcmp(user, USER, ulen) == 0) : 0;
+    int pass_ok = (strlen(password) == plen) ? (gnutls_memcmp(password, PASS, plen) == 0) : 0;
     return user_ok & pass_ok;
 }
 
-static int parse_msgno(const char *arg) {
-    if (!arg || !*arg)
-        return -1;
+static int parse_uint(const char *s, int *out) {
+    if (!s || !*s) return -1;
+    errno = 0;
     char *end;
-    long v = strtol(arg, &end, 10);
-    if (*end != '\0' || v <= 0)
-        return -1;
-    return (int)v;
-}
-
-static int msg_valid(struct session * conn, int n) {
-    return n >= 1 && n <= (int)conn->msg_size && !conn->msgs[n - 1].del;
-}
-
-static int pop3_cmd_capa(struct session *conn, const char *arg) {
-    conn_send(conn, "+OK");
-    if (conn->state == STATE_TRANSACTION) {
-        conn_send(conn, "LIST");
-        conn_send(conn, "TOP");
-        conn_send(conn, "RETR");
-        conn_send(conn, "UIDL");
-        conn_send(conn, "DELE");
-        conn_send(conn, "RSET");
-    }
-    conn_send(conn, "USER");
-    conn_send(conn, "RESP-CODES");
-    conn_send(conn, "QUIT");
-    conn_send(conn, ".");
+    long v = strtol(s, &end, 10);
+    if (errno || *end != '\0' || v < 0 || v > INT_MAX) return -1;
+    *out = (int)v;
     return 0;
 }
 
-static int pop3_cmd_user(struct session * conn, const char * arg) {
-    if (!arg) {
-        conn_send(conn, "-ERR");
-        return 0;
-    }
-    strncpy(conn->user_tmp, arg, sizeof(conn->user_tmp) - 1);
-    conn->user_tmp[sizeof(conn->user_tmp) - 1] = '\0';
-    conn_send(conn, "+OK");
+static int parse_msgno(const char *s, int *out) {
+    int n;
+    if (parse_uint(s, &n) < 0 || n < 1) return -1;
+    *out = n;
     return 0;
 }
 
-static int pop3_cmd_pass(struct session * conn, const char * arg) {
-    if (!conn->user_tmp[0] || !arg || !*arg) {
-        LOG("S: bye ");
-        return -1;
-    }
-    if (auth_userpass(conn->user_tmp, arg)) {
-        load_mailbox(conn, MAILDIR"/cur");
-        conn->state = STATE_TRANSACTION;
-        conn_send(conn, "+OK");
-        return 0;
-    }
-    LOG("AUTH FAIL %s", conn->cip);
-    conn_send(conn, "-ERR failed bye");
-    return -1;
+static int msg_valid(const struct session *conn, int n) {
+    return n >= 1 && (size_t)n <= conn->msg_size && !conn->msgs[n - 1].del;
 }
 
-static int pop3_cmd_stat(struct session * conn, const char *arg) {
-    off_t total = 0;
-    int count = 0;
-    for (int i = 0; i < (int)conn->msg_size; i++) {
-        struct mail * m = &conn->msgs[i];
-        if (m->del) continue;
-        count++;
-        total += m->size;
-    }
-    conn_send(conn, "+OK %d %lld", count, (long long)total);
-    return 0;
-}
-
-static int pop3_cmd_list(struct session *conn, const char *arg) {
-    if (arg && *arg) {
-        int n = parse_msgno(arg);
-        if (!msg_valid(conn, n)) {
-            LOG("S: no msg %d ", n);
-            conn_send(conn, "-ERR");
-            return 0;
-        }
-        conn_send(conn, "+OK %d %lld", n, (long long)conn->msgs[n - 1].size);
-        return 0;
-    }
-    off_t total = 0;
-    int count = 0;
-    for (int i = 0; i < (int)conn->msg_size; i++) {
-        if (!conn->msgs[i].del) {
-            count++;
-            total += conn->msgs[i].size;
-        }
-    }
-    conn_send(conn, "+OK %d msgs (%lld octets)", count, (long long)total);
-    for (int i = 0; i < (int)conn->msg_size; i++) {
-        if (conn->msgs[i].del) {
-            continue;
-        }
-        conn_send(conn, "%d %lld", i + 1, (long long)conn->msgs[i].size);
-    }
-    conn_send(conn, ".");
-    return 0;
-}
-
-static void msg_uid(const char * fname, char * out) {
+static void msg_uid(const char *path, char out[33]) {
     unsigned char digest[16];
+    const char *slash = strrchr(path, '/');
+    const char *fname = slash ? slash + 1 : path;
     const char *colon = strchr(fname, ':');
     size_t len = colon ? (size_t)(colon - fname) : strlen(fname);
 
     int ret = gnutls_hash_fast(GNUTLS_DIG_MD5, fname, len, digest);
     if (ret < 0) {
         LOG("msg_uid: %s", gnutls_strerror(ret));
+        snprintf(out, 33, "%032d", 0);
         return;
     }
     for (int k = 0; k < 16; k++) {
@@ -381,272 +397,282 @@ static void msg_uid(const char * fname, char * out) {
     }
 }
 
-static int pop3_cmd_uidl(struct session * conn, const char *arg) {
-    char uid[33];
-    if (arg && *arg) {
-        int n = parse_msgno(arg);
-        if (!msg_valid(conn, n)) {
-            LOG("S: no msg %d ", n);
-            conn_send(conn, "-ERR");
-            return 0;
-        }
-        msg_uid(conn->msgs[n - 1].path, uid);
-        conn_send(conn, "+OK %d %s", n, uid);
-        return 0;
-    }
-    conn_send(conn, "+OK");
-    for (int i = 0; i < (int)conn->msg_size; i++) {
-        struct mail * m = &conn->msgs[i];
-        if (m->del) continue;
-        msg_uid(m->path, uid);
-        conn_send(conn, "%d %s", i + 1, uid);
-    }
-    conn_send(conn, ".");
-    return 0;
+static int cmd_capa(struct session *c, int argc, char **argv) {
+    conn_send(c, "+OK Capability list follows");
+    conn_send(c, "UIDL");
+    if (c->state == STATE_AUTH)
+        conn_send(c, "USER");
+    conn_send(c, "RESP-CODES");
+    conn_send(c, ".");
+    return CMD_OK;
 }
 
-static size_t mail_truncate(const char *buf, size_t size, int crlf, int max_lines) {
-    if (max_lines < 0) return size;
-    size_t i = 0;
-    while (i < size) {
-        if (!crlf && buf[i] == '\n' && i + 1 < size && buf[i + 1] == '\n')
-            { i += 2; break; }
-        if (crlf  && buf[i] == '\r' && i + 3 < size
-                  && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n')
-            { i += 4; break; }
-        i++;
-    }
-    for (int lines = 0; i < size && lines < max_lines; i++)
-        if (buf[i] == '\n') lines++;
-
-    return i;
+static int cmd_noop(struct session *c, int argc, char **argv) {
+    conn_send(c, "+OK");
+    return CMD_OK;
 }
 
-static char *mail_read(const char *path, size_t *out_size) {
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-
-    char *buf = NULL;
-    do {
-        if (fseek(fp, 0, SEEK_END) != 0) break;
-        long sz = ftell(fp);
-        if (sz <= 0 || sz > MAX_MAIL_SIZE) {
-            LOG("file error: %s (%ld bytes)", path, sz);
-            break;
-        }
-        rewind(fp);
-        buf = malloc((size_t)sz);
-        if (!buf) break;
-        if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
-            free(buf);
-            buf = NULL;
-            break;
-        }
-        *out_size = (size_t)sz;
-    } while (0);
-
-    fclose(fp);
-    return buf;
-}
-
-static char *mail_encode(const char *raw, size_t raw_size, int crlf, size_t *out_size) {
-    size_t extra = 0;
-    for (size_t i = 0; i < raw_size; i++) {
-        if (!crlf && raw[i] == '\n' && (i == 0 || raw[i-1] != '\r')) extra++;
-        if (raw[i] == '.' && (i == 0 || raw[i-1] == '\n')) extra++;
-    }
-    char *buf = malloc(raw_size + extra + 5);
-    if (!buf) return NULL;
-    char *wp = buf;
-    for (size_t i = 0; i < raw_size; i++) {
-        if (raw[i] == '.' && (i == 0 || raw[i-1] == '\n')) *wp++ = '.';
-        if (!crlf && raw[i] == '\n' && (i == 0 || raw[i-1] != '\r')) *wp++ = '\r';
-        *wp++ = raw[i];
-    }
-    if (wp == buf || *(wp - 1) != '\n') { *wp++ = '\r'; *wp++ = '\n'; }
-    *wp++ = '.'; *wp++ = '\r'; *wp++ = '\n';
-    *out_size = (size_t)(wp - buf);
-    return buf;
-}
-
-static int mail_send(struct session *conn, int msgno, int max_lines) {
-    if (conn->sendq_bytes > MAX_SENDQ_BYTES) {
-        conn_send(conn, "-ERR busy");
-        return 0;
-    }
-    size_t raw_size = 0;
-    char *raw = mail_read(conn->msgs[msgno - 1].path, &raw_size);
-    if (!raw) {
-        conn_send(conn, "-ERR");
-        return 0;
-    }
-    int crlf = 0;
-    for (size_t i = 0; i + 1 < raw_size; i++) {
-        if (raw[i] == '\r' && raw[i + 1] == '\n') { crlf = 1; break; }
-        if (raw[i] == '\n') { crlf = 0; break; }
-    }
-    size_t send_size = mail_truncate(raw, raw_size, crlf, max_lines);
-    size_t out_size = 0;
-    char *out = mail_encode(raw, send_size, crlf, &out_size);
-    free(raw);
-    if (!out) {
-        conn_send(conn, "-ERR");
-        return 0;
-    }
-
-    if (conn_send(conn, "+OK %zu octets", out_size - 3) < 0) {
-        free(out);
-        return 0;
-    }
-    if (sendq_attach(conn, out, out_size) < 0) {
-        free(out);
-        conn_send(conn, "-ERR");
-        return 0;
-    }
-    return 0;
-}
-
-static int parse_retr_args(const char *arg, int *msgno, int *lines) {
-    if (!arg || !*arg) return -1;
-    char *end;
-    long n = strtol(arg, &end, 10);
-    if (end == arg || n <= 0) return -1;
-
-    while (*end == ' ' || *end == '\t') end++;
-    if (*end == '\0') {
-        *msgno = (int)n;
-        *lines = -1;
-        return 0;
-    }
-
-    char *end2;
-    long l = strtol(end, &end2, 10);
-    if (end2 == end || *end2 != '\0' || l < 0) return -1;
-    *msgno = (int)n;
-    *lines = (int)l;
-    return 0;
-}
-
-static int pop3_cmd_retr(struct session *conn, const char *arg) {
-    int n, lines;
-    if (parse_retr_args(arg, &n, &lines) < 0 || lines != -1) {
-        conn_send(conn, "-ERR invalid");
-        return 0;
-    }
-    if (!msg_valid(conn, n)) {
-        conn_send(conn, "-ERR no message");
-        return 0;
-    }
-    return mail_send(conn, n, -1);
-}
-
-static int pop3_cmd_top(struct session *conn, const char *arg) {
-    int n, lines;
-    if (!arg || parse_retr_args(arg, &n, &lines) < 0 || lines < 0) {
-        conn_send(conn, "-ERR invalid");
-        return 0;
-    }
-    if (!msg_valid(conn, n)) {
-        conn_send(conn, "-ERR no message");
-        return 0;
-    }
-    return mail_send(conn, n, lines);
-}
-
-static int pop3_cmd_noop(struct session *conn, const char *arg) {
-    conn_send(conn, "+OK");
-    return 0;
-}
-
-static int pop3_cmd_dele(struct session *conn, const char *arg) {
-    int n = parse_msgno(arg);
-    if (!msg_valid(conn, n)) {
-        conn_send(conn, "-ERR no message");
-    } else {
-        conn->msgs[n - 1].del = 1;
-        conn_send(conn, "+OK msg %d del", n);
-    }
-    return 0;
-}
-
-static int pop3_cmd_rset(struct session * conn, const char * arg) {
-    for (int i = 0; i < (int)conn->msg_size; i++) {
-        conn->msgs[i].del = 0;
-    }
-    conn_send(conn, "+OK");
-    return 0;
-}
-
-static int pop3_cmd_quit(struct session * conn, const char * arg) {
-    if(conn->state == STATE_TRANSACTION) {
-        for (int i = 0; i < (int)conn->msg_size; i++) {
-            struct mail * m = &conn->msgs[i];
+static int cmd_quit(struct session *c, int argc, char **argv) {
+    if (c->state == STATE_TRANSACTION) {
+        for (size_t i = 0; i < c->msg_size; i++) {
+            struct mail *m = &c->msgs[i];
             if (!m->del) continue;
             if (unlink(m->path) != 0) {
                 LOG("unlink '%s': %s", m->path, strerror(errno));
             }
         }
     }
-    conn_send(conn, "+OK bye");
-    return 1;
+    conn_send(c, "+OK bye");
+    return CMD_QUIT;
 }
 
-typedef int (*cmd_fn)(struct session * conn, const char * arg);
+static int cmd_user(struct session *c, int argc, char **argv) {
+    if (strlen(argv[0]) >= sizeof(c->user_tmp)) {
+        conn_send(c, "-ERR auth");
+        return CMD_OK;
+    }
+    snprintf(c->user_tmp, sizeof(c->user_tmp), "%s", argv[0]);
+    conn_send(c, "+OK");
+    return CMD_OK;
+}
 
-#define ANY_STATE  (-1)
+static int cmd_pass(struct session *c, int argc, char **argv) {
+    if (!c->user_tmp[0]) {
+        conn_send(c, "-ERR auth");
+        return CMD_OK;
+    }
+    int ok = auth_userpass(c->user_tmp, argv[0]);
+    memset(c->user_tmp, 0, sizeof(c->user_tmp));
+
+    if (ok) {
+        c->auth_fails = 0;
+        load_mailbox(c, MAILDIR"/cur");
+        c->state = STATE_TRANSACTION;
+        conn_send(c, "+OK");
+        return CMD_OK;
+    }
+    c->auth_fails++;
+    LOG("AUTH FAIL %s (%d/%d)", c->cip, c->auth_fails, MAX_AUTH_FAILS);
+    conn_send(c, "-ERR auth");
+    return c->auth_fails >= MAX_AUTH_FAILS ? CMD_QUIT : CMD_OK;
+}
+
+static int cmd_stat(struct session *c, int argc, char **argv) {
+    off_t total = 0;
+    int count = 0;
+    for (size_t i = 0; i < c->msg_size; i++) {
+        if (c->msgs[i].del) continue;
+        count++;
+        total += c->msgs[i].size;
+    }
+    conn_send(c, "+OK %d %lld", count, (long long)total);
+    return CMD_OK;
+}
+
+static int cmd_list(struct session *c, int argc, char **argv) {
+    if (argc == 1) {
+        int n;
+        if (parse_msgno(argv[0], &n) < 0 || !msg_valid(c, n)) {
+            conn_send(c, "-ERR no such message");
+            return CMD_OK;
+        }
+        conn_send(c, "+OK %d %lld", n, (long long)c->msgs[n - 1].size);
+        return CMD_OK;
+    }
+    off_t total = 0;
+    int count = 0;
+    for (size_t i = 0; i < c->msg_size; i++) {
+        if (c->msgs[i].del) continue;
+        count++;
+        total += c->msgs[i].size;
+    }
+    conn_send(c, "+OK %d messages (%lld octets)", count, (long long)total);
+    for (size_t i = 0; i < c->msg_size; i++) {
+        if (c->msgs[i].del) continue;
+        conn_send(c, "%zu %lld", i + 1, (long long)c->msgs[i].size);
+    }
+    conn_send(c, ".");
+    return CMD_OK;
+}
+
+static int cmd_uidl(struct session *c, int argc, char **argv) {
+    char uid[33];
+    if (argc == 1) {
+        int n;
+        if (parse_msgno(argv[0], &n) < 0 || !msg_valid(c, n)) {
+            conn_send(c, "-ERR no such message");
+            return CMD_OK;
+        }
+        msg_uid(c->msgs[n - 1].path, uid);
+        conn_send(c, "+OK %d %s", n, uid);
+        return CMD_OK;
+    }
+    conn_send(c, "+OK");
+    for (size_t i = 0; i < c->msg_size; i++) {
+        if (c->msgs[i].del) continue;
+        msg_uid(c->msgs[i].path, uid);
+        conn_send(c, "%zu %s", i + 1, uid);
+    }
+    conn_send(c, ".");
+    return CMD_OK;
+}
+
+static int cmd_retr(struct session *c, int argc, char **argv) {
+    int n;
+    if (parse_msgno(argv[0], &n) < 0) {
+        conn_send(c, "-ERR invalid argument");
+        return CMD_OK;
+    }
+    if (!msg_valid(c, n)) {
+        conn_send(c, "-ERR no such message");
+        return CMD_OK;
+    }
+    if (sendq_busy(c)) {
+        conn_send(c, "-ERR busy");
+        return CMD_OK;
+    }
+
+    const char *path = c->msgs[n - 1].path;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOG("open '%s': %s", path, strerror(errno));
+        conn_send(c, "-ERR sys");
+        return CMD_OK;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size <= 0 || st.st_size > MAX_MAIL_SIZE) {
+        close(fd);
+        conn_send(c, "-ERR sys");
+        return CMD_OK;
+    }
+
+    struct sendq_node *node = stream_node_new(fd);
+    if (!node) {
+        close(fd);
+        conn_send(c, "-ERR sys");
+        return CMD_OK;
+    }
+    if (conn_send(c, "+OK %lld octets", (long long)st.st_size) < 0) {
+        node_free(node);
+        return CMD_FATAL;
+    }
+    sendq_append(c, node);
+    c->pending_streams++;
+    return CMD_OK;
+}
+
+static int cmd_dele(struct session *c, int argc, char **argv) {
+    int n;
+    if (parse_msgno(argv[0], &n) < 0 || !msg_valid(c, n)) {
+        conn_send(c, "-ERR no such message");
+        return CMD_OK;
+    }
+    c->msgs[n - 1].del = 1;
+    conn_send(c, "+OK message %d deleted", n);
+    return CMD_OK;
+}
+
+#define ST_AUTH   (1u << STATE_AUTH)
+#define ST_TRANS  (1u << STATE_TRANSACTION)
+#define ST_ANY    (ST_AUTH | ST_TRANS)
+
+typedef int (*cmd_fn)(struct session *conn, int argc, char **argv);
 
 struct pop3_cmd {
-    const char *cmd;
-    int state;
-    cmd_fn func;
+    const char *name;
+    unsigned    states;
+    int         min_args;
+    int         max_args;
+    int         raw_arg;
+    int         sensitive;
+    cmd_fn      func;
 };
 
-static const struct pop3_cmd pop3_cmd_table[] = {
-    { "CAPA", ANY_STATE,         pop3_cmd_capa },
-    { "NOOP", ANY_STATE,         pop3_cmd_noop },
-    { "QUIT", ANY_STATE,         pop3_cmd_quit },
-    { "USER", STATE_AUTH,        pop3_cmd_user },
-    { "PASS", STATE_AUTH,        pop3_cmd_pass },
-    { "STAT", STATE_TRANSACTION, pop3_cmd_stat },
-    { "LIST", STATE_TRANSACTION, pop3_cmd_list },
-    { "TOP",  STATE_TRANSACTION, pop3_cmd_top  },
-    { "UIDL", STATE_TRANSACTION, pop3_cmd_uidl },
-    { "RETR", STATE_TRANSACTION, pop3_cmd_retr },
-    { "DELE", STATE_TRANSACTION, pop3_cmd_dele },
-    { "RSET", STATE_TRANSACTION, pop3_cmd_rset },
+static const struct pop3_cmd pop3_cmds[] = {
+    /* name    states    min max raw sens func */
+    { "CAPA",  ST_ANY,   0, 0,  0,  0,   cmd_capa },
+    { "NOOP",  ST_ANY,   0, 0,  0,  0,   cmd_noop },
+    { "QUIT",  ST_ANY,   0, 0,  0,  0,   cmd_quit },
+    { "USER",  ST_AUTH,  1, 1,  1,  0,   cmd_user },
+    { "PASS",  ST_AUTH,  1, 1,  1,  1,   cmd_pass },
+    { "STAT",  ST_TRANS, 0, 0,  0,  0,   cmd_stat },
+    { "LIST",  ST_TRANS, 0, 1,  0,  0,   cmd_list },
+    { "UIDL",  ST_TRANS, 0, 1,  0,  0,   cmd_uidl },
+    { "RETR",  ST_TRANS, 1, 1,  0,  0,   cmd_retr },
+    { "DELE",  ST_TRANS, 1, 1,  0,  0,   cmd_dele },
 };
 
-static int dispatch_pop3_cmd(struct session *conn, const char *cmd, const char *arg) {
-    if (!cmd) {
-        conn_send(conn, "-ERR");
-        return -1;
-    }
-    size_t n = sizeof(pop3_cmd_table) / sizeof(*pop3_cmd_table);
-    for (size_t i = 0; i < n; i++) {
-        const struct pop3_cmd *p = &pop3_cmd_table[i];
-        if (strcmp(p->cmd, cmd) != 0)
-            continue;
-
-        if (p->state != ANY_STATE && p->state != conn->state) {
-            conn_send(conn, "-ERR failed");
-            return 0;
-        }
-        return p->func(conn, arg);
-    }
-    conn_send(conn, "-ERR");
-    return -1;
+static const struct pop3_cmd *find_cmd(const char *name) {
+    for (size_t i = 0; i < sizeof(pop3_cmds) / sizeof(*pop3_cmds); i++)
+        if (strcasecmp(pop3_cmds[i].name, name) == 0)
+            return &pop3_cmds[i];
+    return NULL;
 }
 
-static int process_line(struct session *conn) {
-    if (conn->rlen > 0 && conn->rbuf[conn->rlen - 1] == '\r')
-        conn->rlen--;
-    conn->rbuf[conn->rlen] = '\0';
-    conn->rlen = 0;
-    LOG("C: %s", conn->rbuf);
-    char *saveptr;
-    char *cmd = strtok_r(conn->rbuf, " ", &saveptr);
-    char *arg = strtok_r(NULL, "", &saveptr);
-    return dispatch_pop3_cmd(conn, cmd, arg);
+static int split_args(char *s, char **argv, int max) {
+    int n = 0;
+    while (*s) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+        if (n == max) return -1;
+        argv[n++] = s;
+        while (*s && *s != ' ' && *s != '\t') s++;
+        if (*s) *s++ = '\0';
+    }
+    return n;
+}
+
+static int bad_command(struct session *c, const char *msg) {
+    conn_send(c, "-ERR %s", msg);
+    return ++c->bad_cmds >= MAX_BAD_CMDS ? CMD_FATAL : CMD_OK;
+}
+
+static int dispatch_pop3_cmd(struct session *c, char *line) {
+    char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) {
+        LOG("C: <empty>");
+        return bad_command(c, "empty command");
+    }
+    char *cmd = p;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    if (*p) *p++ = '\0';
+    char *rest = p;
+
+    const struct pop3_cmd *cm = find_cmd(cmd);
+
+    if (cm && cm->sensitive)
+        LOG("C: %s ********", cmd);
+    else if (*rest)
+        LOG("C: %s %s", cmd, rest);
+    else
+        LOG("C: %s", cmd);
+
+    if (!cm)
+        return bad_command(c, "unknown command");
+    if (!(cm->states & (1u << c->state))) {
+        conn_send(c, "-ERR command not allowed in this state");
+        return CMD_OK;
+    }
+
+    char *argv[MAX_ARGS] = { NULL };
+    int argc;
+    if (cm->raw_arg) {
+        argc = *rest ? 1 : 0;
+        argv[0] = rest;
+    } else {
+        argc = split_args(rest, argv, MAX_ARGS);
+        if (argc < 0) {
+            conn_send(c, "-ERR too many arguments");
+            return CMD_OK;
+        }
+    }
+    if (argc < cm->min_args || argc > cm->max_args) {
+        conn_send(c, "-ERR wrong number of arguments");
+        return CMD_OK;
+    }
+    return cm->func(c, argc, argv);
 }
 
 static int feed_input(struct session *conn, const char *data, size_t len) {
@@ -654,9 +680,9 @@ static int feed_input(struct session *conn, const char *data, size_t len) {
         const char *nl = memchr(data, '\n', len);
         size_t chunk = nl ? (size_t)(nl - data) : len;
 
-        if (conn->rlen + chunk >= sizeof(conn->rbuf)) {
+        if (chunk >= sizeof(conn->rbuf) - conn->rlen) {
             conn_send(conn, "-ERR line too long");
-            return 1;
+            return CMD_FATAL;
         }
         memcpy(conn->rbuf + conn->rlen, data, chunk);
         conn->rlen += chunk;
@@ -665,13 +691,21 @@ static int feed_input(struct session *conn, const char *data, size_t len) {
 
         data += chunk + 1;
         len -= chunk + 1;
-        if (process_line(conn)) return 1;
+
+        if (conn->rlen > 0 && conn->rbuf[conn->rlen - 1] == '\r')
+            conn->rlen--;
+        conn->rbuf[conn->rlen] = '\0';
+        conn->rlen = 0;
+        int r = dispatch_pop3_cmd(conn, conn->rbuf);
+        if (r != CMD_OK)
+            return r;
     }
-    return 0;
+    return CMD_OK;
 }
 
-static void epoll_mod(struct server * srv, struct session * conn, uint32_t events) {
+static void epoll_mod(struct server *srv, struct session *conn, uint32_t events) {
     struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
     ev.events = events;
     ev.data.ptr = conn;
     epoll_ctl(srv->epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
@@ -682,34 +716,48 @@ static int process_read(struct session *conn) {
     do {
         ssize_t n = gnutls_record_recv(conn->tls, tmp, sizeof(tmp));
         if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
-            return 0;
+            return CMD_OK;
         }
         if (n <= 0) {
-            return -1;
+            return CMD_FATAL;
         }
         conn->expire_at = time(NULL) + SESSION_TIMEOUT_SEC;
-        if (feed_input(conn, tmp, (size_t)n))
-            return 1;
+        int r = feed_input(conn, tmp, (size_t)n);
+        memset(tmp, 0, sizeof(tmp));
+        if (r != CMD_OK)
+            return r;
     } while (gnutls_record_check_pending(conn->tls) > 0);
-    return 0;
+    return CMD_OK;
 }
 
 static int sendq_flush(struct session *conn) {
+    size_t budget = SEND_BUDGET;
+
     while (conn->send_head) {
-        struct sendq_node * node = conn->send_head;
-        const char * ptr = node->data + node->sent;
+        struct sendq_node *node = conn->send_head;
+
+        if (node->sent == node->size) {
+            if (node->fd >= 0) {
+                if (stream_refill(node) < 0) return -1;
+                continue;
+            }
+            conn->send_head = node->next;
+            if (!conn->send_head) conn->send_tail = NULL;
+            if (node->stream) conn->pending_streams--;
+            node_free(node);
+            continue;
+        }
+
+        if (budget == 0) return 1;
+
+        const char *ptr = node->data + node->sent;
         size_t rem = node->size - node->sent;
 
         ssize_t n = gnutls_record_send(conn->tls, ptr, rem);
         if (n > 0) {
             node->sent += (size_t)n;
-            conn->sendq_bytes -= (size_t)n;
-            if (node->sent == node->size) {
-                conn->send_head = node->next;
-                if (!conn->send_head) conn->send_tail = NULL;
-                free(node->data);
-                free(node);
-            }
+            if (!node->stream) conn->sendq_bytes -= (size_t)n;
+            budget = (size_t)n >= budget ? 0 : budget - (size_t)n;
             continue;
         }
         if (n == GNUTLS_E_AGAIN || n == GNUTLS_E_INTERRUPTED) {
@@ -726,18 +774,18 @@ static void handle_handshake(struct server *srv, struct session *conn) {
         LOG("+ %s fd=%d tls=%s", conn->cip, conn->fd, gnutls_protocol_get_name(gnutls_protocol_get_version(conn->tls)));
         conn->phase = CONN_RUNNING;
         conn->expire_at = time(NULL) + SESSION_TIMEOUT_SEC;
-        conn_send(conn, "+OK ready");
+        conn_send(conn, "+OK POP3 server ready");
         int fr = sendq_flush(conn);
         if (fr < 0) {
             conn_free(srv, conn);
             return;
         }
-        epoll_mod(srv, conn, fr > 0 ? EPOLLIN | EPOLLOUT : EPOLLIN);
+        epoll_mod(srv, conn, fr > 0 ? (EPOLLIN | EPOLLOUT) : EPOLLIN);
         return;
     }
 
     if (gnutls_error_is_fatal(ret)) {
-        LOG("handshake fatal %s: %s (errno=%d: %s)", conn->cip, gnutls_strerror(ret), errno, strerror(errno));
+        LOG("handshake fatal %s: %s", conn->cip, gnutls_strerror(ret));
         conn_free(srv, conn);
         return;
     }
@@ -747,6 +795,10 @@ static void handle_handshake(struct server *srv, struct session *conn) {
 }
 
 static void handle_conn_io(struct server *srv, struct session *conn, uint32_t events) {
+    if (events & EPOLLERR) {
+        conn_free(srv, conn);
+        return;
+    }
     if (events & EPOLLOUT) {
         int r = sendq_flush(conn);
         if (r < 0) {
@@ -758,9 +810,9 @@ static void handle_conn_io(struct server *srv, struct session *conn, uint32_t ev
             return;
         }
     }
-    if ((events & EPOLLIN) && conn->phase == CONN_RUNNING) {
+    if ((events & (EPOLLIN | EPOLLHUP)) && conn->phase == CONN_RUNNING) {
         int r = process_read(conn);
-        if (r != 0) {
+        if (r != CMD_OK) {
             conn->phase = CONN_CLOSING;
             int fr = sendq_flush(conn);
             if (fr < 0 || (fr == 0 && !conn->send_head)) {
@@ -778,14 +830,14 @@ static void handle_conn_io(struct server *srv, struct session *conn, uint32_t ev
             conn_free(srv, conn);
         return;
     }
-    epoll_mod(srv, conn, conn->send_head ? EPOLLIN | EPOLLOUT : EPOLLIN);
+    epoll_mod(srv, conn, conn->send_head ? (EPOLLIN | EPOLLOUT) : EPOLLIN);
 }
 
-static void check_timeouts(struct server * srv) {
+static void check_timeouts(struct server *srv) {
     time_t now = time(NULL);
-    struct session * cur = srv->cons;
+    struct session *cur = srv->cons;
     while (cur) {
-        struct session * next = cur->next;
+        struct session *next = cur->next;
         if (now >= cur->expire_at) {
             LOG("TIMEOUT %s %s", cur->cip, cur->phase == CONN_HANDSHAKE ? "handshake" : "session");
             conn_free(srv, cur);
@@ -794,19 +846,19 @@ static void check_timeouts(struct server * srv) {
     }
 }
 
-static int create_tls_context(struct server *srv, char *cert, char *key) {
-    int ret;
-    ret = gnutls_certificate_allocate_credentials(&srv->tls_creds);
+static int create_tls_context(struct server *srv, const char *cert, const char *key) {
+    int ret = gnutls_certificate_allocate_credentials(&srv->tls_creds);
     if (ret < 0) {
         return -1;
     }
-    ret = gnutls_certificate_set_x509_key_file(srv->tls_creds, cert, key, GNUTLS_X509_FMT_PEM);
+    ret = gnutls_certificate_set_x509_key_file(srv->tls_creds, cert, key,
+                                               GNUTLS_X509_FMT_PEM);
     if (ret < 0) {
         fprintf(stderr, "load cert/key failed: %s\n", gnutls_strerror(ret));
         gnutls_certificate_free_credentials(srv->tls_creds);
         return -1;
     }
-    ret = gnutls_priority_init(&srv->tls_prio,"NORMAL",NULL);
+    ret = gnutls_priority_init(&srv->tls_prio, "NORMAL", NULL);
     if (ret < 0) {
         gnutls_certificate_free_credentials(srv->tls_creds);
         return -1;
@@ -829,7 +881,11 @@ static int create_server(int port) {
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     set_nonblock(fd);
-    struct sockaddr_in addr = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = INADDR_ANY, };
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)port),
+        .sin_addr.s_addr = INADDR_ANY,
+    };
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
         close(fd);
@@ -854,8 +910,8 @@ static int create_epoll(struct server *srv) {
     return epfd;
 }
 
-static struct session * conn_new(struct server *srv, int cfd, gnutls_session_t tls) {
-    struct session * conn = calloc(1, sizeof(struct session));
+static struct session *conn_new(struct server *srv, int cfd, gnutls_session_t tls) {
+    struct session *conn = calloc(1, sizeof(*conn));
     if (!conn) {
         return NULL;
     }
@@ -896,7 +952,7 @@ static void accept_new_connections(struct server *srv) {
         gnutls_transport_set_int(tls, cfd);
         gnutls_certificate_server_set_request(tls, GNUTLS_CERT_IGNORE);
 
-        struct session * conn = conn_new(srv, cfd, tls);
+        struct session *conn = conn_new(srv, cfd, tls);
         if (!conn) {
             gnutls_deinit(tls);
             close(cfd);
@@ -943,8 +999,8 @@ static void cleanup(struct server *srv) {
     while (srv->cons) {
         conn_free(srv, srv->cons);
     }
-    close(srv->server_fd);
-    close(srv->epoll_fd);
+    if (srv->server_fd >= 0) close(srv->server_fd);
+    if (srv->epoll_fd >= 0)  close(srv->epoll_fd);
     gnutls_priority_deinit(srv->tls_prio);
     gnutls_certificate_free_credentials(srv->tls_creds);
     gnutls_global_deinit();
@@ -978,7 +1034,7 @@ int main(int argc, char *argv[]) {
         cleanup(&srv);
         return EXIT_FAILURE;
     }
-    printf("pop3s port=%d\n", port);
+    printf("pop3s %d\n", port);
     run_event_loop(&srv);
     cleanup(&srv);
     return EXIT_SUCCESS;
